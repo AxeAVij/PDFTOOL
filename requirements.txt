@@ -1,2 +1,6 @@
 fastapi
 uvicorn[standard]
+reportlab
+pdfrw
+pymupdf
+requests
