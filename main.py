@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from pdfrw import PdfReader, PdfWriter, PageMerge
@@ -9,7 +9,7 @@ import os, requests
 app = FastAPI()
 
 # === Settings ===
-TEMPLATE_URL = "https://drive.google.com/uc?export=download&id=1Nvuxe1hyXBToMW_b6rOb1AZYdZOnAWZ0"
+TEMPLATE_URL = "https://drive.google.com/uc?export=download&id=YOUR_FILE_ID"
 TEMPLATE_PATH = "/tmp/template.pdf"
 
 
@@ -41,17 +41,18 @@ async def generate_pdf(request: Request):
         merger.add(ol).render()
     PdfWriter(base_output, trailer=template).write()
 
-    # === Step 3: flatten PDF so it can’t be edited ===
+    # === Step 3: flatten PDF ===
     flatten_pdf(base_output, flattened_file)
 
-    # === Step 4: cleanup ===
+    # === Step 4: cleanup old files ===
     cleanup_tmp("/tmp", keep=3, ext=".pdf")
 
-    return JSONResponse({
-        "status": "ok",
-        "buyer_name": buyer_name,
-        "pdf_path": flattened_file
-    })
+    # === Step 5: return actual file ===
+    return FileResponse(
+        flattened_file,
+        media_type="application/pdf",
+        filename=f"{buyer_name}.pdf"
+    )
 
 
 # === Utilities ===
@@ -70,7 +71,7 @@ def flatten_pdf(input_file, output_file):
     """Flatten all contents of a PDF"""
     doc = fitz.open(input_file)
     for page in doc:
-        page.wrap_contents()  # consolidate content into static layer
+        page.wrap_contents()
     doc.save(output_file, deflate=True)
 
 
