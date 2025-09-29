@@ -9,7 +9,7 @@ import os, requests
 app = FastAPI()
 
 # === Settings ===
-TEMPLATE_URL = "https://drive.google.com/uc?export=download&id=YOUR_FILE_ID"
+TEMPLATE_URL = "https://drive.google.com/uc?export=download&id=1Nvuxe1hyXBToMW_b6rOb1AZYdZOnAWZ0"
 TEMPLATE_PATH = "/tmp/template.pdf"
 
 
@@ -47,7 +47,7 @@ async def generate_pdf(request: Request):
     # === Step 4: cleanup old files ===
     cleanup_tmp("/tmp", keep=3, ext=".pdf")
 
-    # === Step 5: return actual file ===
+    # === Step 5: return the actual PDF ===
     return FileResponse(
         flattened_file,
         media_type="application/pdf",
