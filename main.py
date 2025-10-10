@@ -2,84 +2,76 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse
 from reportlab.pdfgen import canvas
 from pdfrw import PdfReader, PdfWriter, PageMerge
-from reportlab.lib.colors import white
 import fitz  # PyMuPDF
 import requests
 import os
-import traceback
+import zipfile
 
 app = FastAPI()
 
-# === SETTINGS ===
-# Put your Google Drive FILE_ID into the URL below (Any one with link = Viewer)
 TEMPLATE_URL = "https://drive.google.com/uc?export=download&id=1Nvuxe1hyXBToMW_b6rOb1AZYdZOnAWZ0"
 TEMPLATE_PATH = "/tmp/template.pdf"
 
-# Default text placement on the page (adjust to your template)
-# Coordinates are in PDF points with origin at bottom-left.
+# Return ZIP if file exceeds this many bytes (set to None to always return PDF)
+MAX_INLINE_BYTES = 8 * 1024 * 1024   # ~8 MB (tune for your Zap)
+
 TEXT_X = 150
 TEXT_Y = 500
 TEXT_FONT = "Helvetica-Bold"
 TEXT_SIZE = 20
-
-# Optional: cover a placeholder area first (white-out) before drawing text.
-# Set to None to skip. If you want to cover, set to (x, y, width, height).
 COVER_BOX = None  # e.g., (140, 488, 220, 24)
-
 
 @app.post("/generate-pdf")
 async def generate_pdf(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
+    data = await request.json()
     buyer_name = (data or {}).get("buyer_name") or "Customer"
 
-    # Ensure template is cached in /tmp
     template_path = get_template()
+    pw, ph = get_template_page_size(template_path)
 
-    # Resolve page size from the template's first page
-    page_width, page_height = get_template_page_size(template_path)
+    overlay_path  = f"/tmp/{buyer_name}_overlay.pdf"
+    merged_path   = f"/tmp/{buyer_name}.pdf"
+    flattened_pdf = f"/tmp/{buyer_name}_flattened.pdf"
+    zipped_file   = f"/tmp/{buyer_name}.zip"
 
-    # Paths
-    overlay_path = f"/tmp/{buyer_name}_overlay.pdf"
-    merged_path  = f"/tmp/{buyer_name}.pdf"
-    final_path   = f"/tmp/{buyer_name}_flattened.pdf"
-
-    # 1) Build overlay the SAME SIZE as template's first page
+    # 1) Build overlay same size as template
     build_overlay_pdf(
-        overlay_path=overlay_path,
-        text=buyer_name,
-        page_width=page_width,
-        page_height=page_height,
-        x=TEXT_X, y=TEXT_Y,
-        font=TEXT_FONT,
-        font_size=TEXT_SIZE,
-        cover_box=COVER_BOX
+        overlay_path, buyer_name, pw, ph,
+        TEXT_X, TEXT_Y, TEXT_FONT, TEXT_SIZE, COVER_BOX
     )
 
-    # 2) Merge overlay onto template (overlay only applied to first page)
+    # 2) Merge overlay onto template (first page)
     merge_overlay_onto_template(template_path, overlay_path, merged_path)
 
-    # 3) Flatten the PDF so it can't be edited
-    flatten_pdf(merged_path, final_path)
+    # 3) Flatten + try to compress aggressively
+    flatten_and_compress_pdf(merged_path, flattened_pdf)
 
-    # 4) (Optional) clean older PDFs in /tmp
-    cleanup_tmp("/tmp", keep=5, ext=".pdf")
+    # 4) If large, zip it
+    file_to_send = flattened_pdf
+    filename     = f"{buyer_name}.pdf"
+    if MAX_INLINE_BYTES is not None:
+        try:
+            size = os.path.getsize(flattened_pdf)
+            if size > MAX_INLINE_BYTES:
+                with zipfile.ZipFile(zipped_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    zf.write(flattened_pdf, arcname=f"{buyer_name}.pdf")
+                file_to_send = zipped_file
+                filename     = f"{buyer_name}.zip"
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="Failed to generate output file")
 
-    # 5) Return the ACTUAL PDF file stream
-    return FileResponse(
-        final_path,
-        media_type="application/pdf",
-        filename=f"{buyer_name}.pdf"
-    )
+    # 5) Tidy up old artifacts (optional)
+    cleanup_tmp("/tmp", keep=6, ext=".pdf")
+    cleanup_tmp("/tmp", keep=6, ext=".zip")
+
+    # 6) Return the actual file (PDF or ZIP)
+    media_type = "application/zip" if file_to_send.endswith(".zip") else "application/pdf"
+    return FileResponse(file_to_send, media_type=media_type, filename=filename)
 
 
 # ---------- Utilities ----------
 
 def get_template():
-    """Ensure the template.pdf exists in /tmp; download if missing."""
     if not os.path.exists(TEMPLATE_PATH):
         r = requests.get(TEMPLATE_URL, timeout=60)
         r.raise_for_status()
@@ -87,9 +79,7 @@ def get_template():
             f.write(r.content)
     return TEMPLATE_PATH
 
-
 def get_template_page_size(template_path: str):
-    """Read first page size using PyMuPDF (width, height) in points."""
     doc = fitz.open(template_path)
     if doc.page_count == 0:
         doc.close()
@@ -99,72 +89,46 @@ def get_template_page_size(template_path: str):
     doc.close()
     return w, h
 
-
-def build_overlay_pdf(
-    overlay_path: str,
-    text: str,
-    page_width: float,
-    page_height: float,
-    x: float,
-    y: float,
-    font: str = "Helvetica-Bold",
-    font_size: int = 20,
-    cover_box=None
-):
-    """
-    Create a 1-page overlay with identical size to the template's first page.
-    Optionally paint a white rectangle (COVER_BOX) over the placeholder area,
-    then draw the replacement text at (x, y).
-    """
+def build_overlay_pdf(overlay_path, text, pw, ph, x, y, font, font_size, cover_box):
     from reportlab.pdfgen import canvas
-
-    c = canvas.Canvas(overlay_path, pagesize=(page_width, page_height))
-
+    from reportlab.lib.colors import white
+    c = canvas.Canvas(overlay_path, pagesize=(pw, ph))
     if cover_box:
         cx, cy, cw, ch = cover_box
         c.setFillColor(white)
         c.setStrokeColor(white)
-        c.rect(cx, cy, cw, ch, stroke=0, fill=1)  # white-out area
-
+        c.rect(cx, cy, cw, ch, stroke=0, fill=1)
     c.setFont(font, font_size)
     c.drawString(x, y, text)
     c.showPage()
     c.save()
 
-
 def merge_overlay_onto_template(template_path: str, overlay_path: str, output_path: str):
-    """
-    Merge 1-page overlay onto the FIRST page of the template.
-    Other pages remain untouched.
-    """
     template_pdf = PdfReader(template_path)
     overlay_pdf  = PdfReader(overlay_path)
-
     if not template_pdf.pages:
         raise HTTPException(status_code=500, detail="Template PDF has no pages")
-
-    # If overlay exists, merge onto first page
     if overlay_pdf.pages:
-        first_page = template_pdf.pages[0]
-        first_overlay = overlay_pdf.pages[0]
-        merger = PageMerge(first_page)
-        merger.add(first_overlay).render()
-
+        merger = PageMerge(template_pdf.pages[0])
+        merger.add(overlay_pdf.pages[0]).render()
     PdfWriter(output_path, trailer=template_pdf).write()
 
-
-def flatten_pdf(input_file: str, output_file: str):
-    """
-    Flatten the PDF so text/annotations become static page content.
-    """
+def flatten_and_compress_pdf(input_file: str, output_file: str):
+    # Flatten and apply aggressive cleanup / compression
     doc = fitz.open(input_file)
     for page in doc:
-        page.wrap_contents()  # consolidate into static content stream
-    doc.save(output_file, deflate=True)
+        page.wrap_contents()
+    # Save with cleanup flags; this can shrink quite a bit
+    doc.save(
+        output_file,
+        deflate=True,          # compress streams
+        clean=True,            # rebuild xref, remove unused objects
+        garbage=4,             # maximum garbage collection
+        linear=True            # web-optimized
+    )
     doc.close()
 
-
-def cleanup_tmp(folder="/tmp", keep=5, ext=".pdf"):
+def cleanup_tmp(folder="/tmp", keep=6, ext=".pdf"):
     try:
         files = [
             os.path.join(folder, f)
@@ -175,5 +139,4 @@ def cleanup_tmp(folder="/tmp", keep=5, ext=".pdf"):
         while len(files) > keep:
             os.remove(files.pop(0))
     except Exception:
-        # Non-fatal; keep going
-        print("Cleanup error:\n", traceback.format_exc())
+        pass
